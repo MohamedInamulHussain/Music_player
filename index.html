@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline Music Player</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#0ea5e9" />
+  <style>
+    :root { --bg:#0b1220; --card:#111a2b; --text:#e6edf3; --muted:#a1a1aa; --accent:#0ea5e9; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding:18px 16px; text-align:center; background: linear-gradient(180deg, #0f172a 0, #0b1220 100%); border-bottom:1px solid #1e293b;}
+    h1 { margin:0; font-size:1.25rem; }
+    .wrap { max-width:980px; margin: 0 auto; padding: 16px; }
+    .card { background: var(--card); border:1px solid #1f2937; border-radius:18px; padding:14px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    .row > * { flex: 1 1 auto; }
+    .controls button, .secondary button, label.btn {
+      background:#0f172a; color:var(--text); border:1px solid #233145; border-radius:12px;
+      padding:10px 14px; cursor:pointer; font-weight:600;
+    }
+    .controls button:hover, .secondary button:hover, label.btn:hover { border-color:#2d3f5b; }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .pill { display:inline-block; padding:6px 10px; border-radius:999px; font-size:.9rem; border:1px solid #2a3a54; color:var(--muted); }
+    .grid { display:grid; grid-template-columns: 1fr; gap:12px; }
+    @media (min-width: 860px) { .grid { grid-template-columns: 1fr 1fr; } }
+    ul { list-style:none; padding:0; margin:0; max-height: 52vh; overflow:auto; }
+    li { padding:10px 12px; border-radius:10px; border:1px solid transparent; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    li:hover { background:#0f172a; border-color:#223149; }
+    li.active { background: rgba(14,165,233,.12); border-color: #1f90c4; }
+    .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .small { color: var(--muted); font-size:.9rem; }
+    audio { width:100%; margin-top: 8px; }
+    .hidden-input { display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎵 Offline Music Player</h1>
+    <div class="small">PWA · Works offline · Playlists stay on your device</div>
+  </header>
+
+  <div class="wrap">
+    <div class="grid">
+      <!-- LEFT: Player -->
+      <section class="card">
+        <div class="row" style="align-items:flex-start">
+          <div style="flex:1">
+            <div class="pill" id="nowPlayingPill">No song selected</div>
+            <audio id="audio" controls></audio>
+          </div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="controls">
+          <button id="prevBtn">⏮ Prev</button>
+          <button id="playPauseBtn">⏯ Play/Pause</button>
+          <button id="nextBtn">⏭ Next</button>
+          <button id="loopBtn">🔁 Loop: Off</button>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="secondary controls">
+          <label class="btn" for="fileInput">➕ Add songs from device</label>
+          <input id="fileInput" class="hidden-input" type="file" accept="audio/*" multiple />
+          <button id="saveBtn" title="Saves your current playlist for true offline use">💾 Save playlist offline</button>
+          <button id="loadBtn">📥 Load saved playlist</button>
+          <button id="clearSavedBtn">🗑 Clear saved</button>
+          <button id="installBtn" style="display:none;">📲 Install App</button>
+        </div>
+      </section>
+
+      <!-- RIGHT: Playlist -->
+      <section class="card">
+        <div class="row" style="justify-content:space-between">
+          <h3 style="margin:4px 0">Playlist</h3>
+          <div class="small" id="countInfo">0 songs</div>
+        </div>
+        <ul id="playlist"></ul>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    // --- IndexedDB helpers for saving songs offline as blobs ---
+    const DB_NAME = 'music-player-db';
+    const DB_STORE = 'tracks';
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE, { keyPath: 'id', autoIncrement: true });
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function clearSaved() {
+      const db = await openDB();
+      await new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).clear();
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+      });
+    }
+
+    async function saveFilesAsBlobs(files) {
+      const db = await openDB();
+      const tx = db.transaction(DB_STORE, 'readwrite');
+      const store = tx.objectStore(DB_STORE);
+      for (const f of files) {
+        const buf = await f.arrayBuffer();
+        await new Promise((res, rej) => {
+          const req = store.add({ name: f.name, type: f.type, blob: new Blob([buf], { type: f.type }) });
+          req.onsuccess = () => res();
+          req.onerror = () => rej(req.error);
+        });
+      }
+      await new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); });
+    }
+
+    async function loadSavedBlobs() {
+      const db = await openDB();
+      return await new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const store = tx.objectStore(DB_STORE);
+        const all = [];
+        const req = store.openCursor();
+        req.onsuccess = (e) => {
+          const cur = e.target.result;
+          if (cur) {
+            all.push(cur.value);
+            cur.continue();
+          } else res(all);
+        };
+        req.onerror = () => rej(req.error);
+      });
+    }
+
+    // --- App state ---
+    const audio = document.getElementById('audio');
+    const fileInput = document.getElementById('fileInput');
+    const playlistEl = document.getElementById('playlist');
+    const nowPlayingPill = document.getElementById('nowPlayingPill');
+    const countInfo = document.getElementById('countInfo');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const loopBtn = document.getElementById('loopBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    const loadBtn = document.getElementById('loadBtn');
+    const clearSavedBtn = document.getElementById('clearSavedBtn');
+
+    let playlist = [];      // Array<{name, url, blob?}>
+    let currentIndex = -1;
+    let loop = false;
+
+    function updateCount() {
+      countInfo.textContent = `${playlist.length} ${playlist.length === 1 ? 'song' : 'songs'}`;
+    }
+
+    function renderPlaylist() {
+      playlistEl.innerHTML = '';
+      playlist.forEach((track, i) => {
+        const li = document.createElement('li');
+        li.className = i === currentIndex ? 'active' : '';
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = track.name;
+        const actions = document.createElement('div');
+        actions.innerHTML = `<button data-i="${i}" class="miniDel">Remove</button>`;
+        li.appendChild(name);
+        li.appendChild(actions);
+        li.addEventListener('click', (e) => {
+          if (e.target.classList.contains('miniDel')) return;
+          currentIndex = i;
+          playCurrent();
+          renderPlaylist();
+        });
+        actions.querySelector('.miniDel').addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeAt(i);
+        });
+        playlistEl.appendChild(li);
+      });
+      updateCount();
+    }
+
+    function removeAt(i) {
+      const wasCurrent = i === currentIndex;
+      const url = playlist[i]?.url;
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+      playlist.splice(i, 1);
+      if (playlist.length === 0) {
+        currentIndex = -1;
+        audio.removeAttribute('src');
+        nowPlayingPill.textContent = 'No song selected';
+      } else if (wasCurrent) {
+        currentIndex = Math.min(i, playlist.length - 1);
+        playCurrent();
+      } else if (i < currentIndex) {
+        currentIndex -= 1;
+      }
+      renderPlaylist();
+    }
+
+    function playCurrent() {
+      if (currentIndex < 0 || currentIndex >= playlist.length) return;
+      const track = playlist[currentIndex];
+      audio.src = track.url;
+      audio.play();
+      nowPlayingPill.textContent = `Now Playing: ${track.name}`;
+    }
+
+    function nextSong() {
+      if (playlist.length === 0) return;
+      if (currentIndex < playlist.length - 1) {
+        currentIndex++;
+      } else if (loop) {
+        currentIndex = 0;
+      } else {
+        audio.pause();
+        return;
+      }
+      playCurrent();
+      renderPlaylist();
+    }
+
+    function prevSong() {
+      if (playlist.length === 0) return;
+      if (currentIndex > 0) {
+        currentIndex--;
+      } else if (loop) {
+        currentIndex = playlist.length - 1;
+      }
+      playCurrent();
+      renderPlaylist();
+    }
+
+    fileInput.addEventListener('change', (e) => {
+      const files = Array.from(e.target.files);
+      const newTracks = files.map(f => ({ name: f.name, url: URL.createObjectURL(f) }));
+      // Append to playlist (don’t wipe existing)
+      playlist.push(...newTracks);
+      if (currentIndex === -1 && playlist.length > 0) currentIndex = 0;
+      renderPlaylist();
+      if (audio.paused) playCurrent();
+      // remember lightweight list in localStorage (names only)
+      localStorage.setItem('playlistNames', JSON.stringify(playlist.map(t => t.name)));
+    });
+
+    playPauseBtn.addEventListener('click', () => {
+      if (audio.paused) audio.play(); else audio.pause();
+    });
+    prevBtn.addEventListener('click', prevSong);
+    nextBtn.addEventListener('click', nextSong);
+    loopBtn.addEventListener('click', () => {
+      loop = !loop;
+      loopBtn.textContent = `🔁 Loop: ${loop ? 'On' : 'Off'}`;
+    });
+    audio.addEventListener('ended', nextSong);
+
+    saveBtn.addEventListener('click', async () => {
+      // Convert current playlist URLs back to Blobs if possible
+      // Only saves tracks with blob: URLs (picked this session)
+      const urls = playlist.map(p => p.url);
+      // We cannot fetch file://, but blob: is fine in same origin
+      const blobTracks = [];
+      for (let i = 0; i < playlist.length; i++) {
+        try {
+          const resp = await fetch(urls[i]);
+          const blob = await resp.blob();
+          blobTracks.push(new File([blob], playlist[i].name, { type: blob.type || 'audio/mpeg' }));
+        } catch {}
+      }
+      if (blobTracks.length === 0) {
+        alert('Nothing to save yet. Add songs using the button first.');
+        return;
+      }
+      await saveFilesAsBlobs(blobTracks);
+      alert('Playlist saved for offline use ✅');
+    });
+
+    loadBtn.addEventListener('click', async () => {
+      const saved = await loadSavedBlobs();
+      if (!saved.length) {
+        alert('No saved playlist found.');
+        return;
+      }
+      // Revoke existing blob URLs first
+      playlist.forEach(t => t.url?.startsWith('blob:') && URL.revokeObjectURL(t.url));
+      playlist = saved.map(s => ({ name: s.name, url: URL.createObjectURL(s.blob) }));
+      currentIndex = playlist.length ? 0 : -1;
+      renderPlaylist();
+      playCurrent();
+      alert('Loaded saved playlist 🎉');
+    });
+
+    clearSavedBtn.addEventListener('click', async () => {
+      await clearSaved();
+      alert('Cleared saved playlist.');
+    });
+
+    // Restore names (cosmetic) if present
+    (function boot() {
+      const names = JSON.parse(localStorage.getItem('playlistNames') || '[]');
+      if (names.length) {
+        playlist = names.map(n => ({ name: n, url: '' }));
+        currentIndex = 0;
+        renderPlaylist();
+        nowPlayingPill.textContent = 'Select ➕ Add songs from device';
+      }
+    })();
+
+    // --- PWA install button ---
+    let deferredPrompt = null;
+    const installBtn = document.getElementById('installBtn');
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      installBtn.style.display = 'inline-block';
+    });
+    installBtn.addEventListener('click', async () => {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      deferredPrompt = null;
+      installBtn.style.display = 'none';
+    });
+
+    // Register Service Worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(console.error);
+    }
+  </script>
+</body>
+</html>
